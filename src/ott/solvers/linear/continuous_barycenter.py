@@ -95,20 +95,18 @@ class FreeBarycenterState(NamedTuple):
     def solve_linear_ot(
         a: Optional[jnp.ndarray], x: jnp.ndarray, b: jnp.ndarray, y: jnp.ndarray
     ):
-        geom = pointcloud.PointCloud(
+      geom = pointcloud.PointCloud(
           x, y, cost_fn=bar_prob.cost_fn, epsilon=bar_prob.epsilon
-          )
-        prob = linear_problem.LinearProblem(
-            geom,
-            a=a,
-            b=b,
-            tau_a=tau_a,
-            tau_b=1.0,
-        )
-
-        out = linear_solver(prob)
-        # instantiate matrix since it is a property of out.
-        return out, out.matrix
+      )
+    
+      # IMPORTANT: preserve exact old behavior when tau_a == 1.0 by not passing tau_*.
+      if tau_a < 1.0:
+        prob = linear_problem.LinearProblem(geom, a=a, b=b, tau_a=tau_a, tau_b=1.0)
+      else:
+        prob = linear_problem.LinearProblem(geom, a=a, b=b)
+    
+      out = linear_solver(prob)
+      return out, out.matrix
 
     outs, matrices = solve_linear_ot(self.a, self.x, seg_b, seg_y)
     reg_ot_costs = outs.reg_ot_cost
