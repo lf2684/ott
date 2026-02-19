@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
-from typing import Any, NamedTuple, Optional, Tuple, Union
+from typing import Any, NamedTuple, Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -76,6 +76,15 @@ class FreeBarycenterState(NamedTuple):
       bar_prob: the barycenter problem.
       linear_solver: the linear OT solver to use.
       store_errors: whether to store the errors of the inner loop.
+      tau_a: Relaxation parameter for the barycenter marginal.
+        Must lie in (0, 1].
+        If less than 1, unbalanced transport is used on the barycenter side.
+      learn_a: If True, update barycenter weights using the row marginals of the
+        transport plans.
+      a_update: Strategy for updating barycenter weights. Either "mean" for a
+        weighted arithmetic mean, or "geom" for a weighted geometric mean.
+      a_floor: Small positive constant used to avoid numerical instability
+        when updating barycenter weights.
 
     Returns:
       The updated state.
@@ -96,7 +105,7 @@ class FreeBarycenterState(NamedTuple):
             tau_a=tau_a,
             tau_b=1.0,
         )
-        
+
         out = linear_solver(prob)
         # instantiate matrix since it is a property of out.
         return out, out.matrix
@@ -130,7 +139,7 @@ class FreeBarycenterState(NamedTuple):
     # matrices has shape [num_measures, bar_size, max_measure_size]
     if learn_a:
       row_marginals = jnp.sum(matrices, axis=2)  # [num_measures, bar_size]
-    
+
       if a_update == "geom":
         # Weighted geometric mean, with floor for stability.
         rm = jnp.clip(row_marginals, a_min=a_floor)
@@ -139,12 +148,12 @@ class FreeBarycenterState(NamedTuple):
       else:
         # Default: weighted arithmetic mean.
         a_new = jnp.sum(row_marginals * bar_prob.weights[:, None], axis=0)
-    
+
       a_new = jnp.clip(a_new, a_min=a_floor)
       a_new = a_new / jnp.sum(a_new)
     else:
       a_new = self.a
-    
+
     return self.set(
         x=x_new,
         a=a_new,
@@ -216,133 +225,135 @@ class FreeBarycenterOutput(NamedTuple):
 
 @jax.tree_util.register_pytree_node_class
 class FreeWassersteinBarycenter(was_solver.WassersteinSolver):
-    """Continuous Wasserstein barycenter solver :cite:`cuturi:14`.
+  """Continuous Wasserstein barycenter solver :cite:`cuturi:14`.
 
-    This solver computes a free-support Wasserstein barycenter of multiple
-    input measures by alternating between solving entropic OT problems and
-    updating barycenter support locations.
-    
-    Parameters
-    ----------
-    linear_solver:
-      Inner linear OT solver (e.g. :class:`~ott.solvers.linear.sinkhorn.Sinkhorn`).
-    tau_a:
-      Relaxation parameter for the barycenter marginal. Must lie in (0, 1].
-      If ``tau_a < 1``, unbalanced transport is used on the barycenter side,
-      allowing barycenter masses to deviate from their current values.
-      If ``tau_a = 1``, transport is balanced and barycenter masses remain fixed.
-    learn_a:
-      If True, update barycenter weights using the row marginals of the
-      transport plans at each outer iteration. Requires ``tau_a < 1`` for
-      masses to change.
-    a_init:
-      Optional initialization for barycenter weights. If None, weights are
-      initialized uniformly.
-    a_update:
-      Strategy for updating barycenter weights. Either ``"mean"`` for a
-      weighted arithmetic mean of row marginals, or ``"geom"`` for a
-      weighted geometric mean.
-    a_floor:
-      Small positive constant used to avoid numerical instability when
-      updating barycenter weights (prevents log(0) and zero-mass supports).
+  This solver computes a free-support Wasserstein barycenter of multiple
+  input measures by alternating between solving entropic OT problems and
+  updating barycenter support locations.
+
+  Parameters
+  ----------
+  linear_solver:
+    Inner linear OT solver (e.g.
+    :class:`~ott.solvers.linear.sinkhorn.Sinkhorn`).
+  tau_a:
+    Relaxation parameter for the barycenter marginal. Must lie in (0, 1].
+    If ``tau_a < 1``, unbalanced transport is used on the barycenter side,
+    allowing barycenter masses to deviate from their current values.
+    If ``tau_a = 1``, transport is balanced and barycenter masses remain fixed.
+  learn_a:
+    If True, update barycenter weights using the row marginals of the
+    transport plans at each outer iteration. Requires ``tau_a < 1`` for
+    masses to change.
+  a_init:
+    Optional initialization for barycenter weights. If None, weights are
+    initialized uniformly.
+  a_update:
+    Strategy for updating barycenter weights. Either ``"mean"`` for a
+    weighted arithmetic mean of row marginals, or ``"geom"`` for a
+    weighted geometric mean.
+  a_floor:
+    Small positive constant used to avoid numerical instability when
+    updating barycenter weights (prevents log(0) and zero-mass supports).
+  """
+
+  def __init__(
+      self,
+      linear_solver,
+      *,
+      tau_a: float = 1.0,
+      learn_a: bool = False,
+      a_init: Optional[jnp.ndarray] = None,
+      a_update: str = "mean",
+      a_floor: float = 1e-12,
+      **kwargs,
+  ):
+    super().__init__(linear_solver=linear_solver, **kwargs)
+    self.tau_a = tau_a
+    self.learn_a = learn_a
+    self.a_init = a_init
+    self.a_update = a_update
+    self.a_floor = a_floor
+
+    if not (0.0 < tau_a <= 1.0):
+      raise ValueError("tau_a must be in (0, 1].")
+    if a_update not in ("mean", "geom"):
+      raise ValueError("a_update must be 'mean' or 'geom'.")
+    if a_floor <= 0.0:
+      raise ValueError("a_floor must be > 0.")
+
+  def __call__(  # noqa: D102
+      self,
+      bar_prob: barycenter_problem.FreeBarycenterProblem,
+      bar_size: int = 100,
+      x_init: Optional[jnp.ndarray] = None,
+      rng: Optional[jax.Array] = None,
+  ) -> FreeBarycenterOutput:
+    rng = utils.default_prng_key(rng)
+    return self.iterations(bar_size, bar_prob, x_init, rng)
+
+  def init_state(
+      self,
+      bar_prob: barycenter_problem.FreeBarycenterProblem,
+      bar_size: int,
+      x_init: Optional[jnp.ndarray] = None,
+      rng: Optional[jax.Array] = None,
+  ) -> FreeBarycenterState:
+    """Initialize the state of the Wasserstein barycenter iterations.
+
+    Args:
+      bar_prob: The barycenter problem.
+      bar_size: Size of the barycenter.
+      x_init: Initial barycenter estimate of shape ``[bar_size, ndim]``.
+        If `None`, ``bar_size`` points will be sampled from the input measures
+        according to their weights
+        :attr:`~ott.problems.linear.barycenter_problem.FreeBarycenterProblem.flattened_y`.
+      rng: Random key for seeding.
+
+    Returns:
+      The initial barycenter state.
     """
+    if x_init is not None:
+      assert bar_size == x_init.shape[0]
+      x = x_init
+    else:
+      rng = utils.default_prng_key(rng)
+      indices_subset = jax.random.choice(
+          rng,
+          a=bar_prob.flattened_y.shape[0],
+          shape=(bar_size,),
+          replace=False,
+          p=bar_prob.flattened_b,
+      )
+      x = bar_prob.flattened_y[indices_subset, :]
 
-    def __init__(
-        self,
-        linear_solver,
-        *,
-        tau_a: float = 1.0,
-        learn_a: bool = False,
-        a_init: Optional[jnp.ndarray] = None,
-        a_update: str = "mean",
-        a_floor: float = 1e-12,
-        **kwargs,
-    ):
-        super().__init__(linear_solver=linear_solver, **kwargs)
-        self.tau_a = tau_a
-        self.learn_a = learn_a
-        self.a_init = a_init
-        self.a_update = a_update
-        self.a_floor = a_floor
+    # Barycenter weights initialization (defaults to uniform).
+    if self.a_init is not None:
+      a = jnp.asarray(self.a_init)
+      if a.shape != (bar_size,):
+        raise ValueError("a_init must have shape (bar_size,).")
+      a = jnp.clip(a, a_min=0.0)
+      a = a / jnp.sum(a)
+    else:
+      a = jnp.ones((bar_size,)) / bar_size
 
-        if not (0.0 < tau_a <= 1.0):
-          raise ValueError("tau_a must be in (0, 1].")
-        if a_update not in ("mean", "geom"):
-          raise ValueError("a_update must be 'mean' or 'geom'.")
-        if a_floor <= 0.0:
-          raise ValueError("a_floor must be > 0.")
+    num_iter = self.max_iterations
+    if self.store_inner_errors:
+      errors = -jnp.ones(
+          (num_iter, bar_prob.num_measures, self.linear_solver.outer_iterations)
+      )
+    else:
+      errors = None
 
-    def __call__(  # noqa: D102
-        self,
-        bar_prob: barycenter_problem.FreeBarycenterProblem,
-        bar_size: int = 100,
-        x_init: Optional[jnp.ndarray] = None,
-        rng: Optional[jax.Array] = None,
-    ) -> FreeBarycenterOutput:
-        rng = utils.default_prng_key(rng)
-        return self.iterations(bar_size, bar_prob, x_init, rng)
+    state = FreeBarycenterState(
+        x=x,
+        a=a,
+        costs=-jnp.ones((num_iter,)),
+        linear_convergence=-jnp.ones((num_iter,)),
+        errors=errors,
+    )
 
-    def init_state(
-        self,
-        bar_prob: barycenter_problem.FreeBarycenterProblem,
-        bar_size: int,
-        x_init: Optional[jnp.ndarray] = None,
-        rng: Optional[jax.Array] = None,
-    ) -> FreeBarycenterState:
-        """Initialize the state of the Wasserstein barycenter iterations.
-    
-        Args:
-          bar_prob: The barycenter problem.
-          bar_size: Size of the barycenter.
-          x_init: Initial barycenter estimate of shape ``[bar_size, ndim]``.
-            If `None`, ``bar_size`` points will be sampled from the input
-            measures according to their weights
-            :attr:`~ott.problems.linear.barycenter_problem.FreeBarycenterProblem.flattened_y`.
-          rng: Random key for seeding.
-    
-        Returns:
-          The initial barycenter state.
-        """
-        if x_init is not None:
-          assert bar_size == x_init.shape[0]
-          x = x_init
-        else:
-          # sample randomly points in the support of the y measures
-          rng = utils.default_prng_key(rng)
-          indices_subset = jax.random.choice(
-              rng,
-              a=bar_prob.flattened_y.shape[0],
-              shape=(bar_size,),
-              replace=False,
-              p=bar_prob.flattened_b
-          )
-          x = bar_prob.flattened_y[indices_subset, :]
-    
-        # Barycenter weights initialization (defaults to uniform).
-        if self.a_init is not None:
-          a = jnp.asarray(self.a_init)
-          if a.shape != (bar_size):
-              raise ValueError("a_init must have shape (bar_size,).")
-          a = jnp.clip(a, a_min=0.0)
-          a = a / jnp.sum(a)
-        else:
-          a = jnp.ones((bar_size,)) / bar_size
-        
-        num_iter = self.max_iterations
-        if self.store_inner_errors:
-          errors = -jnp.ones((
-              num_iter, bar_prob.num_measures, self.linear_solver.outer_iterations
-          ))
-        else:
-          errors = None
-        state = FreeBarycenterState(
-            x=x,
-            a=a,
-            costs=-jnp.ones((num_iter,)),
-            linear_convergence=-jnp.ones((num_iter,)),
-            errors=errors
-        )
-        abstract_tree = jax.eval_shape(
+    abstract_tree = jax.eval_shape(
         functools.partial(
             state.update,
             store_errors=self.store_inner_errors,
@@ -354,78 +365,78 @@ class FreeWassersteinBarycenter(was_solver.WassersteinSolver):
         0,
         bar_prob,
         self.linear_solver,
-        )
-    
-        linear_outputs = jax.tree.map(jnp.zeros_like, abstract_tree.linear_outputs)
-    
-        return FreeBarycenterState(
-            x=x,
-            a=a,
-            costs=-jnp.ones((num_iter,)),
-            linear_convergence=-jnp.ones((num_iter,)),
-            linear_outputs=linear_outputs,
-            errors=errors
-        )
-    # noqa: D102
-    def output_from_state(
-        self,
+    )
+
+    linear_outputs = jax.tree.map(jnp.zeros_like, abstract_tree.linear_outputs)
+
+    return FreeBarycenterState(
+        x=x,
+        a=a,
+        costs=-jnp.ones((num_iter,)),
+        linear_convergence=-jnp.ones((num_iter,)),
+        linear_outputs=linear_outputs,
+        errors=errors,
+    )
+
+  def output_from_state(  # noqa: D102
+      self,
+      state: FreeBarycenterState,
+      bar_prob: barycenter_problem.FreeBarycenterProblem,
+  ) -> FreeBarycenterOutput:
+    """Create an output from a barycenter state."""
+    return FreeBarycenterOutput(
+        x=state.x,
+        a=state.a,
+        bar_prob=bar_prob,
+        costs=state.costs,
+        linear_convergence=state.linear_convergence,
+        linear_outputs=state.linear_outputs,
+        errors=state.errors,
+    )
+
+  def iterations(
+      self,
+      bar_size: int,
+      bar_prob: barycenter_problem.FreeBarycenterProblem,
+      x_init: jnp.ndarray,
+      rng: jax.Array,
+  ) -> FreeBarycenterOutput:
+    """Wasserstein barycenter outer loop."""
+
+    def cond_fn(
+        iteration: int,
+        constants: barycenter_problem.FreeBarycenterProblem,
         state: FreeBarycenterState,
-        bar_prob: barycenter_problem.FreeBarycenterProblem
-    ) -> FreeBarycenterOutput:
-        """Create an output from a barycenter state."""
-        return FreeBarycenterOutput(
-            x=state.x,
-            a=state.a,
-            bar_prob=bar_prob,
-            costs=state.costs,
-            linear_convergence=state.linear_convergence,
-            linear_outputs=state.linear_outputs,
-            errors=state.errors,
-        )
+    ) -> bool:
+      return self._continue(state, iteration)
 
-    def iterations(
-        self, 
-        bar_size: int, 
-        bar_prob: barycenter_problem.FreeBarycenterProblem,
-        x_init: jnp.ndarray, 
-        rng: jax.Array
+    def body_fn(
+        iteration: int,
+        constants: barycenter_problem.FreeBarycenterProblem,
+        state: FreeBarycenterState,
+        compute_error: bool,
     ) -> FreeBarycenterState:
-        """Wasserstein barycenter outer loop."""
+      del compute_error  # Always assumed True
+      bar_prob = constants
+      return state.update(
+          iteration,
+          bar_prob,
+          self.linear_solver,
+          self.store_inner_errors,
+          tau_a=self.tau_a,
+          learn_a=self.learn_a,
+          a_update=self.a_update,
+          a_floor=self.a_floor,
+      )
 
-        def cond_fn(
-            iteration: int,
-            constants: barycenter_problem.FreeBarycenterProblem,
-            state: FreeBarycenterState
-        ) -> bool:
-            return self._continue(state, iteration)
-    
-        def body_fn(
-            iteration: int, 
-            constants: barycenter_problem.FreeBarycenterProblem,
-            state: FreeBarycenterState, 
-            compute_error: bool
-        ) -> FreeBarycenterState:
-            del compute_error  # Always assumed True
-            bar_prob = constants
-            return state.update(
-                iteration,
-                bar_prob,
-                self.linear_solver,
-                self.store_inner_errors,
-                tau_a=self.tau_a,
-                learn_a=self.learn_a,
-                a_update=self.a_update,
-                a_floor=self.a_floor,
-            )
-    
-        state = fixed_point_loop.fixpoint_iter(
-            cond_fn=cond_fn,
-            body_fn=body_fn,
-            min_iterations=self.min_iterations,
-            max_iterations=self.max_iterations,
-            inner_iterations=1,
-            constants=bar_prob,
-            state=self.init_state(bar_prob, bar_size, x_init, rng)
-        )
-    
-        return self.output_from_state(state, bar_prob)
+    state = fixed_point_loop.fixpoint_iter(
+        cond_fn=cond_fn,
+        body_fn=body_fn,
+        min_iterations=self.min_iterations,
+        max_iterations=self.max_iterations,
+        inner_iterations=1,
+        constants=bar_prob,
+        state=self.init_state(bar_prob, bar_size, x_init, rng),
+    )
+
+    return self.output_from_state(state, bar_prob)
